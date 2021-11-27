@@ -1,408 +1,258 @@
+from dataclasses import dataclass
+from datetime import timedelta, datetime, timezone
+from typing import Tuple, List, Union, Dict
 import logging
+
+import ldap
+
 logger = logging.getLogger(__name__)
 
+EPOCH_TIMESTAMP = 116444736000000000
+
+def windows_timestamp_to_datetime(timestamp: int) -> datetime:
+    """ Convert Windows timestamp to datetime – because *Microsoft* """
+    nanoseconds = (timestamp - EPOCH_TIMESTAMP) // 10
+    dt = datetime(1970, 1, 1) + timedelta(microseconds=nanoseconds)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+class LDAPException(Exception):
+    pass
+
+
+@dataclass
 class LDAPWizard:
-    LDAP_SRV = get_env_value['LDAP_SERVER']
-    LDAP_SUPER_USER = get_env_value('LDAP_SUPER_USER')
+    LDAP_USER = settings.AUTH_LDAP_BIND_DN
+    LDAP_PASSWORD = settings.AUTH_LDAP_BIND_PASSWORD
+    LDAP_SERVER = settings.AUTH_LDAP_QUERY_SERVER_URI
+    connection: 'ldap.ldapobject.SimpleLDAPObject' = None
+    debug: bool = False
 
-    def __init__(self, ldap_user=None, ldap_pwd=None, ldap_srv=None, debug=False, user='SYSTEM'):
-        """ Initializes LDAP connection object. Server MUST be ldaps, otherwise some actions
-        like password changes are declined by the server. (ERROR: UNWILLING TO PERFORM) """
-        self.ldap_user = ldap_user or ''
-        self.ldap_pwd = ldap_pwd or ''
-        self.ldap_srv = ldap_srv or self.LDAP_SRV
-        self.debug = debug or False
-        self.user = user
+    def __post_init__(self):
+        if not self.connection: self.connection = self.login()
 
-        self.connection = self.login()
-
-    @classmethod
-    def super_user(cls, debug=False):
-        """ User used to alter Active Directory with minimal privileges. """
-        logger.debug('Logging in as LDAP super user...', extra={'user': self.user})
-        ldap_user = self.LDAP_SUPER_USER
-        ldap_pwd = get_env_value('LDAP_SUPER_PASSWORD')
-        ldap_srv = get_env_value('LDAP_SERVER')
-
-        return cls(ldap_user, ldap_pwd, ldap_srv, debug)
-
-    def login(self):
-
+    def login(self) -> 'ldap.ldapobject.SimpleLDAPObject':
         ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
         ldap.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
         ldap.set_option(ldap.OPT_X_TLS_DEMAND, True)
-        if(self.debug):
-            ldap.set_option(ldap.OPT_DEBUG_LEVEL, 255)
+        if (self.debug): ldap.set_option(ldap.OPT_DEBUG_LEVEL, 255)
 
-        logger.debug(f'Attempting to login LDAP user {self.ldap_user}', extra={'user': self.user, 'uid': self.ldap_user})
+        logger.debug(f'Attempting to login LDAP user {self.LDAP_USER}',)
         try:
-            if(self.ldap_user == '' or self.ldap_pwd == '' or self.ldap_user is None or self.ldap_pwd is None):
-                raise ldap.INVALID_CREDENTIALS
+            if not self.LDAP_USER or not self.LDAP_PASSWORD: raise ldap.INVALID_CREDENTIALS
 
-            l = ldap.initialize(self.ldap_srv)
-            l.simple_bind_s(self.ldap_user, self.ldap_pwd)
-            logger.info(f'User {self.ldap_user} logged in successfully to propagate Active Directory changes.', extra={'user': self.user, 'uid': self.ldap_user})
+            l = ldap.initialize(self.LDAP_SERVER)
+            l.simple_bind_s(self.LDAP_USER, self.LDAP_PASSWORD)
+            logger.info(f'User {self.LDAP_USER} logged in successfully to query Active Directory server "{self.LDAP_SERVER}"')
             return l
 
         except ldap.INVALID_CREDENTIALS as e:
-
-            if(self.ldap_user != self.LDAP_SUPER_USER):
-                x = LDAPWizard.super_user()
-                if(x.active_lockout(self.ldap_user)):
-                    logger.error(f'LDAP login refused due to user lockout {self.ldap_user}', extra={'user': self.user, 'uid': self.ldap_user})
-                    raise Exception('User lockout active.') from None
-
-                elif(x.expired_password(self.ldap_user)):
-                    logger.error(f'LDAP login refused due to user password expiration {self.ldap_user}', extra={'user': self.user, 'uid': self.ldap_user})
-                    raise Exception('User password expired.') from None
-                else:
-                    logger.error(f'Invalid credentials for user {self.ldap_user} during LDAP login.', extra={'user': self.user, 'uid': self.ldap_user})
-                    raise Exception('User or password invalid.') from None
-
-            else:
-                logger.exception('Could not login to LDAP login with super user.', extra={'user': self.user, 'uid': self.ldap_user})
-                raise Exception('Please contact your Administrator. Degraded system functionality.') from None
+            logger.exception(f'LDAP Authentication failed for user {self.LDAP_USER}')
+            raise LDAPException('AD Credentials invalid or user locked out.') from None
 
         except ldap.SERVER_DOWN as e:
-            logger.error(f'Cannot reach LDAP server {self.ldap_srv}', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Server unreachable.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user})
-            raise Exception('An unknown error occurred.') from None
+            logger.exception(f'Cannot reach LDAP server "{self.LDAP_SERVER}"')
+            raise LDAPException(f'AD server "{self.LDAP_SERVER}" unreachable.') from None
 
-    def logout(self):
+    def logout(self) -> bool:
         self.connection.unbind_s()
-        logger.debug(f'User {self.ldap_user} logged out.', extra={'user': self.user, 'uid': self.ldap_user})
+        logger.debug(f'Logout successful for user {self.LDAP_USER}')
+        return True
 
-    def set_attribute_value(self, object_dn, attribute, value):
-        """ Helper function that adds a value if, the attribute is string. 
-
-        CAUTION: May cause SERIOUS problems, if DNs of users/groups/computers include ';' in name
-        """
-        if(';' in value):
-            logger.debug(f'value: {value} must not contain ";" for add_attribute_value_str.', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Illegal value.') from None
-
-        try:
-            mod_attrs = [(ldap.MOD_REPLACE, attribute, [value.encode('utf-8')])]
-            self.connection.modify_s(object_dn, mod_attrs)
-            logger.info(f'Successfully added value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, adding value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for adding {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def add_attribute_value_str(self, object_dn, attribute, value):
-        """ Helper function that adds a value if, the attribute is string. 
-
-        CAUTION: May cause SERIOUS problems, if DNs of users/groups/computers include ';' in name
-        """
-        if(';' in value):
-            logger.debug(f'value: {value} must not contain ";" for add_attribute_value_str.')
-            raise Exception('Illegal value.') from None
-
-        _value = self.get_attribute_value(object_dn, attribute)
-
-        logger.debug(f'Found values {attribute}: {_value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-
-        if(value in _value):
-            logger.error(f'value {attribute}: {value} already in values {_value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Value already present.') from None
-        elif isinstance(_value, list):
-            # convert list to ';'-delimited string
-            _value = '; '.join(_value)
-        else:
-            # do nothing lol
-            _value = _value
-
-        try:
-            _value = '{}; {}'.format(_value, value)
-            mod_attrs = [(ldap.MOD_REPLACE, attribute, [_value.encode('utf-8')])]
-            self.connection.modify_s(object_dn, mod_attrs)
-            logger.info(f'Successfully added value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, adding value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for adding {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def add_attribute_value(self, object_dn, attribute, value):
-        """
-        Adds a {value} to an {attribute} of a given {object_dn}. It is expected
-        that the {attribute}-field is list at first. In case it is a string the
-        exception handles said case.
-        """
-        if(';' in value):
-            logger.debug(f'value: {value} must not contain ";" for add_attribute_value_str.', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Illegal value.') from None
-
-        try:
-            logger.debug(f'ADD ({object_dn}) {attribute}: {value}', extra={'user': self.user, 'uid': object_dn})
-            add_attrs = [(ldap.MOD_ADD, attribute, [value.encode('utf-8')])]
-            self.connection.modify_s(object_dn, add_attrs)
-            logger.info(f'Successfully added value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-
-        # If this error is thrown, the attribute is likely a string and is therefore modified
-        #   by appending {value} to the already existing string.
-        except ldap.TYPE_OR_VALUE_EXISTS as e:
-            logger.info(f'Value for {attribute} ({object_dn}) already exists. Trying', extra={'user': self.user, 'uid': object_dn})
-            self.add_attribute_value_str(object_dn, attribute, value)
-
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, adding value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for adding {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def remove_attribute_value_str(self, object_dn, attribute, value):
-        """ Helper function that removes a value if, the attribute is string. 
-
-        CAUTION: May cause SERIOUS problems, if DNs of users/groups/computers include ';' in name
-        """
-        if(';' in value):
-            logger.debug(f'value: {value} must not contain ";" for add_attribute_value_str.', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Illegal value.') from None
-
-        _value = self.get_attribute_value(object_dn, attribute)
-
-        logger.debug(f'Found values {attribute}: {_value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-
-        if(value not in _value):
-            logger.error(f'Value {attribute}: {value} not in values {_value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Illegal value.') from None
-
-        elif isinstance(_value, list):
-            # convert list to ';'-delimited string after removing value
-            _value.remove(value)
-            _value = '; '.join(_value)
-        else:
-            _value = None
-
-        try:
-            mod_attrs = [(ldap.MOD_REPLACE, attribute, [_value.encode('utf-8')])]
-            self.connection.modify_s(object_dn, mod_attrs)
-            logger.info(f'Successfully removed value {attribute}: {value} ({object_dn})')
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, removing value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for removing {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def remove_attribute_value(self, object_dn, attribute, value):
-        """ Removes a {value} of an {attribute} of a given {object_dn}. It is expected 
-        that the {attribute}-field is list at first. In case it is a string the
-        exception handles said case.
-        """
-        if(';' in value):
-            logger.debug(f'value: {value} must not contain ";" for add_attribute_value_str.', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Illegal value.') from None
-
-        try:
-            logger.debug(f'DELETE ({object_dn}) {attribute}: {value}', extra={'user': self.user, 'uid': object_dn})
-            delete_attrs = [(ldap.MOD_DELETE, attribute, [value.encode('utf-8')])]
-            self.connection.modify_s(object_dn, delete_attrs)
-            logger.info(f'Successfully removed value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-
-        # If this error is thrown, the attribute is likely a string and is therefore modified
-        #   by appending {value} to the already existing string.
-        except ldap.NO_SUCH_ATTRIBUTE as e:
-            logger.info(f'Value for {attribute} ({object_dn}) could not be deleted.', extra={'user': self.user, 'uid': object_dn})
-            self.remove_attribute_value_str(object_dn, attribute, value)
-
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, removing value {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for removing {attribute}: {value} ({object_dn})', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def get_attribute_value(self, object_dn, attribute):
-        """ Gets an {attribute}-value of a given {object_dn}. 
-        Returns either a list of objects or a byte-list of objects, depending on
-            the attribute's datatype in Active Directory.
-        """
-        logger.debug(f'Querying LDAP for {object_dn}: {attribute} with user: {self.ldap_user})', extra={'user': self.user, 'uid': object_dn})
-        try:
-            r = self.connection.search_s(object_dn, ldap.SCOPE_SUBTREE, '(objectClass=*)', [attribute])
-            if(attribute in r[0][1].keys()):
-                if(len(r[0][1][attribute]) == 1):
-                    value = r[0][1][attribute][0].decode('utf-8')
-                    # Makes list out of attributes, if there should be multiple values
-                    if(';' in value):
-                        value = value.replace('; ', ';')
-                        values = value.split(';')
-                        return values
-                    else:
-                        return value
-                else:
-                    return r[0][1][attribute]
-            else:
-                logger.error(f'Attribute {object_dn}: {attribute} does not exist.', extra={'user': self.user, 'uid': object_dn})
-                raise Exception('Requested attribute could not be retrieved or empty.') from None
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, retrieving attribute {object_dn}: {attribute}', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist have attribute {object_dn}: {attribute}', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
-
-    def search_base_dn(self, object_dn, attributes=['distinguishedName', 'extensionAttribute14'], objectClass='*'):
+    def search(self, object_dn: str, criteria: str=None) -> List[Tuple]:
         """ Searches everything within a given OU. Objects can be filtered down by applying objectClass.
-            Afterwards it will display all defined attributes.
+        Afterwards it will display all defined attributes. Sample arguments:
 
-        object_dn:
-            'ou=Gruppen,dc=sys,dc=loc'
-
-        objectClass:
-            *, group, computer, user, ...
+        object_dn: 'ou=Gruppen,dc=sys,dc=loc'
+        objectClass: *, group, computer, user, ...
         """
-        logger.debug(f'Querying LDAP for {object_dn}: {attributes}, objectClass="{objectClass}" (User: {self.ldap_user})')
+
+        logger.debug(f'Querying LDAP for {object_dn}, {criteria}')
+        criteria = criteria or '(objectClass=*)'
 
         try:
-            r = self.connection.search_s(object_dn, ldap.SCOPE_SUBTREE, f'(objectClass={objectClass})', attributes)
+            r = self.connection.search_s(object_dn, ldap.SCOPE_SUBTREE, criteria)
+
             for dn, entry in r:
-                logger.debug('Processing', repr(dn))
+                logger.debug(f'Processing {repr(dn)}')
                 logger.debug(entry)
+
             return r
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access for user {self.ldap_user}, querying all values {object_dn}: {attributes}, objectClass="{objectClass}")', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.NO_SUCH_OBJECT as e:
-            logger.error(f'Requested object does not exist for querying {object_dn}: {attributes}, objectClass="{objectClass}")', extra={'user': self.user, 'uid': object_dn})
-            raise Exception('Object not found.') from None
-        except Exception as e:
-            logger.exception(str(e), extra={'user': self.user, 'uid': object_dn})
-            raise Exception('An unknown error occurred.') from None
 
-    def change_password(self, new_password, old_password=None, user_dn=None):
-        """ Change user password. In order to do so we require both the current and the new
-        password of the affected user, if we're not dealing w/ a privileged AD user. """
+        except ldap.INSUFFICIENT_ACCESS:
+            logger.exception(f'Insufficient access for user {self.LDAP_USER}, querying all values {object_dn}, {criteria}')
+            raise LDAPException('Insufficient access.') from None
 
-        if(user_dn != None and old_password == None):
-            logger.info(f'Invoked password change for {user_dn}...', extra={'user': self.user, 'uid': user_dn})
+        except ldap.NO_SUCH_OBJECT:
+            logger.error(f'Requested object does not exist for querying {object_dn}, {criteria}')
+            raise LDAPException(f'Object not found or does not exist "{object_dn}"')
 
-            new_pwd = '"{0}"'.format(new_password).encode('utf-16-le')
-            mod_list = [
-                (ldap.MOD_REPLACE, "unicodePwd", new_pwd),
-            ]
-        else:
-            user_dn = user_dn or self.ldap_user
-            old_password = old_password or self.ldap_pwd
+    def get_users(self) -> List[Tuple[str, str]]:
+        """ Returns a list of distinguishedNames and sAMAccountNames in the defined BASE_DN and SEARCH_CRITERIA """
+        users = self.search(
+            object_dn=settings.AUTH_LDAP_USER_SEARCH.base_dn,
+            criteria=settings.LDAP_SEARCH_USER_CRITERIA
+        )
+        formatted_users = []
+        for distinguished_name, user in users:
+            sam_account_name = user.get('sAMAccountName')[0].decode()
+            formatted_users.append((distinguished_name, sam_account_name))
 
-            logger.info(f'Password change for {user_dn}...', extra={'user': self.user, 'uid': user_dn})
-            old_pwd = '"{0}"'.format(old_password).encode('utf-16-le')
-            new_pwd = '"{0}"'.format(new_password).encode('utf-16-le')
+        return formatted_users
 
-            mod_list = [
-                (ldap.MOD_DELETE, "unicodePwd", old_pwd),
-                (ldap.MOD_ADD, "unicodePwd", new_pwd),
-            ]
+    def get_attribute(self, object_dn: str, attributes: List[str], criteria: str=None) -> Dict[str, Union[list, str, int, None]]:
+        """ Gets the {attribute}-value of a given {object_dn}. Depending on the
+        attribute's data-type in AD DS returns either a list, str or int """
 
-        try:
-            self.connection.modify_s(user_dn, mod_list)
-        except ldap.INSUFFICIENT_ACCESS as e:
-            logger.error(f'Insufficient access to change {user_dn} password with user: {self.ldap_user}', extra={'user': self.user, 'uid': self.ldap_user})
-            raise Exception('Insufficient access.') from None
-        except ldap.CONSTRAINT_VIOLATION as e:
-            logger.error(f'Password change for {user_dn} does not meet server criteria (complexity, length, history, ...)', extra={'user': self.user, 'uid': user_dn})
-            raise Exception('Password requirements not met. Passwords must not contain part of the username, must have '
-                            'lower- and upper case letters and must not be a previously used password. Further requirements may apply. '
-                            'Please try again using a different password or contact your Administrator.') from None
+        logger.debug(f'Querying LDAP for {object_dn}: {attributes}')
 
-    def get_group_dns(self, object_dn):
+        instance = self.search(object_dn=object_dn, criteria=criteria)
+        if len(instance) > 1:
+            logger.error(f'Multiple instances returned for {object_dn}')
+            return {}  # more than one object-instance
+
+        info = {}
+        for attribute in attributes:
+            value = instance[0][1].get(attribute)
+
+            if isinstance(value, list) and len(value) > 1:
+                info.setdefault(attribute, [i.decode() for i in value])
+            elif isinstance(value, list):
+                value = value[0].decode()
+                if value.isdigit(): value = int(value)
+                info.setdefault(attribute, value)
+            else:
+                info.setdefault(attribute, value)
+
+        return info
+
+    def get_groups(self, search_ou: str):
         """ Arbitrary function that gets all Groups from {object_dn}
         and returns a mapped dict {'groupName': 'CN=...'}. """
         processed_groups = {}
-        groups = self.search_base_dn(object_dn, objectClass='Group', attributes=['distinguishedName', 'cn'])
+        groups = self.search(search_ou, criteria='(objectClass=Group)')
 
         for dn, group in groups:
             cn = group['cn'][0].decode('utf-8')
             dn = group['distinguishedName'][0].decode('utf-8')
             processed_groups[cn] = dn
 
-        logger.debug(f'Processed groups: {processed_groups}', extra={'user': self.user, 'uid': object_dn})
+        logger.debug(f'Processed groups: {processed_groups}')
         return processed_groups
 
-    def add_user_group(self, group_dn, user_dn):
-        """ Adds a given user to a group.
-        Expects user_dn, e.g. CN=Service User,OU=Mitarbeiter,DC=sys,DC=loc
-        Expects group_dn e.g. CN=Test Group,OU=Gruppen,DC=sys,DC=loc
 
-        Alternativer Ansatz:
-            add_attrs = [(ldap.MOD_ADD, 'member', [user_dn.encode('utf-8')])]
-            r = l.modify_s(group_dn, add_attrs)
-            return 'success'
-        """
-        logger.info(f'Adding user {user_dn} to group {group_dn}', extra={'user': self.user, 'uid': group_dn})
-        self.add_attribute_value(group_dn, 'member', user_dn)
 
-    def remove_user_group(self, group_dn, user_dn):
-        """ Removes a given user to a group.
-        Expects user_dn, e.g. CN=Service User,OU=Mitarbeiter,DC=sys,DC=loc
-        Expects group_dn e.g. CN=Test Group,OU=Gruppen,DC=sys,DC=loc
-        """
-        logger.info(f'Removing user {user_dn} from group {group_dn}', extra={'user': self.user, 'uid': group_dn})
-        self.remove_attribute_value(group_dn, 'member', user_dn)
-        #delete_attrs = [(ldap.MOD_DELETE, 'member', [user_dn.encode('utf-8')])]
-        #l.modify_s(group_dn, delete_attrs)
+@dataclass
+class LDAPUser:
+    """ Class to evaluate userAccountControl state for the various properties it can take
+    REF: http://www.selfadsi.org/ads-attributes/user-userAccountControl.htm """
+    username: str
+    distinguished_name: str
+    user_account_control: int  # decimal representation like in AD DS (e.g. 512)
 
-    def user_status(self, user_dn):
-        """ userAccountControl status overview
-            == 512 enabled user
-            == 514 disabled (+2) 
-            == 528 lockout (+16)
-            == 66048 dont expire pwd (+64)
-            == 8389120 (pwd expired)
+    @property
+    def user_account_control_binary(self):
+        """ Converts decimal to binary 512 -> 00000000000000000000001000000000 """
+        binary = bin(self.user_account_control)[2:]
+        return binary.zfill(32)
 
-            === 4096 enabled computer
-        https://support.microsoft.com/en-us/help/305144/how-to-use-useraccountcontrol-to-manipulate-user-account-properties
-        """
-        status = self.search_base_dn(base_dn=user_dn, attributes=['userAccountControl'], objectClass='user')
-        return status[0][1]['userAccountControl'][0].decode('utf-8')
+    @property
+    def account_ok(self) -> bool:
+        return self.normal_account and \
+               not self.is_disabled and \
+               not self.is_locked_out and \
+               not self.password_expired
 
-    def expired_password(self, user_dn):
-        """ Evaluates if a password has expired. """
-        pwdLastSet = self.search_base_dn(base_dn=user_dn, attributes=['pwdLastSet'], objectClass='user')
-        if(pwdLastSet[0][1]['pwdLastSet'][0].decode('utf-8') == '0' or self.user_status(user_dn) == 8389120):
-            logger.info(f'User {user_dn} password expired.', extra={'user': self.user, 'uid': user_dn})
-            return True
-        else:
-            logger.debug(f'User {user_dn} password not expired.', extra={'user': self.user, 'uid': user_dn})
-            return False
+    @property
+    def normal_account(self) -> bool:
+        return self.binary_position(23) == 1 and \
+               not self.workstation_trust_account and \
+               not self.interdomain_trust_account and \
+               not self.server_trust_account
 
-    def remove_lockout(self, user_dn):
-        logger.info(f'Removing lockout from {user_dn}')
-        self.set_attribute_value(user_dn, 'lockoutTime', '0')
+    @property
+    def is_disabled(self) -> bool:
+        return self.binary_position(31) == 1
 
-    def active_lockout(self, user_dn):
-        """ Evaluates whether or not a given {user_dn} is locked out of their account. """
-        lockout = self.search_base_dn(base_dn=user_dn, attributes=['lockoutTime'], objectClass='user')
-        if(lockout[0][1]['lockoutTime'][0].decode('utf-8') != '0' and self.user_status(user_dn) == 514):
-            logger.info(f'User {user_dn} locked out.', extra={'user': self.user, 'uid': user_dn})
-            return True
-        else:
-            logger.debug(f'User {user_dn} not locked out.', extra={'user': self.user, 'uid': user_dn})
-            return False
+    @property
+    def is_locked_out(self) -> bool:
+        """ Checks if a user is locked out according to userAccountControl """
+        return self.binary_position(28) == 1
+
+    @property
+    def password_dont_expire(self) -> bool:
+        return self.binary_position(16) == 1
+
+    @property
+    def password_expired(self) -> bool:
+        return self.binary_position(9) == 1
+
+    @property
+    def password_not_required(self) -> bool:
+        return self.binary_position(27) == 1
+
+    @property
+    def cant_change_password(self) -> bool:
+        return self.binary_position(26) == 1
+
+    @property
+    def smartcard_required(self) -> bool:
+        return self.binary_position(14) == 1
+
+    @property
+    def interdomain_trust_account(self) -> bool:
+        return self.binary_position(21) == 1
+
+    @property
+    def workstation_trust_account(self) -> bool:
+        return self.binary_position(20) == 1
+
+    @property
+    def server_trust_account(self) -> bool:
+        return self.binary_position(19) == 1
+
+    def binary_position(self, pos: int) -> int:
+        return int(self.user_account_control_binary[pos-1])
+
+    @property
+    def groups(self) -> List[str]:
+        return self.get_attribute('memberOf')
+
+    def get_attribute(self, attribute: str) -> Union[list, str, int, None]:
+        """ Helper function to get a certain user's attribute """
+        ldap_wizard = LDAPWizard()
+        ldap_attribute = ldap_wizard.get_attribute(
+            object_dn=self.distinguished_name,
+            attributes=[attribute]
+        )
+        return ldap_attribute.get(attribute)
+
+    @classmethod
+    def from_distinguished_name(cls, distinguished_name):
+        ldap_wizard = LDAPWizard()
+        user_info = ldap_wizard.get_attribute(
+            object_dn=distinguished_name,
+            attributes=['sAMAccountName', 'userAccountControl'],
+            criteria='(objectClass=User)'
+        )
+        user = cls(
+            username=user_info.get('sAMAccountName'),
+            distinguished_name=distinguished_name,
+            user_account_control=user_info.get('userAccountControl')
+        )
+        return user
+
+    @classmethod
+    def from_sam_account_name(cls, sam_account_name):
+        ldap_wizard = LDAPWizard()
+        user_info = ldap_wizard.get_attribute(
+            object_dn=settings.AUTH_LDAP_USER_SEARCH.base_dn,
+            attributes=['distinguishedName', 'userAccountControl'],
+            criteria=f'(sAMAccountName={sam_account_name})'
+        )
+        user = cls(
+            username=sam_account_name,
+            distinguished_name=user_info.get('distinguishedName'),
+            user_account_control=user_info.get('userAccountControl')
+        )
+        return user
